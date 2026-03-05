@@ -19,7 +19,7 @@ function ProtectedRoute({ children }) {
 export default function App() {
   return (
     <Routes>
-      <Route path="/" element={<Navigate to={isAuthed() ? (localStorage.getItem("home_route") || "/chat") : "/login"} replace />} />
+      <Route path="/" element={<Navigate to="/login" replace />} />
       <Route path="/login" element={<Login />} />
       <Route path="/register" element={<Register />} />
       <Route

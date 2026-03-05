@@ -4,7 +4,7 @@ import Button from "../components/Button.jsx";
 
 export default function Settings() {
   const [orgName, setOrgName] = useState("Enterprise Offline Knowledge System");
-  const [defaultUserRole, setDefaultUserRole] = useState("Viewer");
+  const [defaultUserRole, setDefaultUserRole] = useState("User");
   const [allowRegistrations, setAllowRegistrations] = useState(true);
   const [statusMsg, setStatusMsg] = useState("");
   const [errorMsg, setErrorMsg] = useState("");
@@ -20,7 +20,7 @@ export default function Settings() {
         const data = await res.json().catch(() => ({}));
         if (!res.ok) throw new Error(data?.error || "Failed to load settings");
         setOrgName(data?.org_name || "Enterprise Offline Knowledge System");
-        setDefaultUserRole(data?.default_user_role || "Viewer");
+        setDefaultUserRole(data?.default_user_role || "User");
         setAllowRegistrations(Boolean(data?.allow_registrations));
       } catch (err) {
         setErrorMsg(err?.message || "Failed to load settings.");
@@ -84,8 +84,7 @@ export default function Settings() {
                 onChange={(e) => setDefaultUserRole(e.target.value)}
                 className="w-full rounded-xl border border-zinc-200 bg-white px-4 py-3 text-sm outline-none transition focus:border-zinc-400 focus:ring-4 focus:ring-zinc-100"
               >
-                <option>Viewer</option>
-                <option>Editor</option>
+                <option>User</option>
                 <option>Admin</option>
               </select>
             </label>

@@ -16,7 +16,6 @@ export default function Register() {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
-  const [role, setRole] = useState("Viewer");
 
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -27,10 +26,9 @@ export default function Register() {
       name.trim().length > 1 &&
       username.trim().length > 2 &&
       password.length >= 6 &&
-      confirmPassword.length >= 6 &&
-      role.trim().length > 0
+      confirmPassword.length >= 6
     );
-  }, [name, username, password, confirmPassword, role]);
+  }, [name, username, password, confirmPassword]);
 
   async function onSubmit(e) {
     e.preventDefault();
@@ -52,8 +50,7 @@ export default function Register() {
           email,
           password,
           name,
-          username,
-          role,
+          username
         }),
       });
 
@@ -113,20 +110,6 @@ export default function Register() {
                 placeholder="Re-enter your password"
                 autoComplete="new-password"
               />
-
-              <label className="block">
-                <span className="mb-1 block text-sm text-zinc-600">User Role</span>
-                <select
-                  className="w-full rounded-xl border border-zinc-200 bg-white px-4 py-3 text-sm outline-none transition focus:border-zinc-400 focus:ring-4 focus:ring-zinc-100"
-                  value={role}
-                  onChange={(e) => setRole(e.target.value)}
-                >
-                  <option>Viewer</option>
-                  <option>Editor</option>
-                  <option>Admin</option>
-                </select>
-              </label>
-
               {error ? (
                 <div className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{error}</div>
               ) : null}

@@ -16,7 +16,7 @@ export default function Users() {
     name: "",
     username: "",
     email: "",
-    role: "Viewer",
+    role: "User",
     status: "Active",
     password: "",
   });
@@ -52,7 +52,7 @@ export default function Users() {
   async function onEditUser(user) {
     setStatusMsg("");
     setErrorMsg("");
-    const nextRole = user.role === "Viewer" ? "Editor" : user.role === "Editor" ? "Admin" : "Viewer";
+    const nextRole = user.role === "Admin" ? "User" : "Admin";
     try {
       const token = localStorage.getItem("auth_token");
       const res = await fetch(`/api/users/${user.id}`, {
@@ -130,7 +130,7 @@ export default function Users() {
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data?.error || "Create failed");
       setUsers((prev) => [data.user, ...prev]);
-      setCreateForm({ name: "", username: "", email: "", role: "Viewer", status: "Active", password: "" });
+      setCreateForm({ name: "", username: "", email: "", role: "User", status: "Active", password: "" });
       setShowCreate(false);
       setStatusMsg("User created.");
     } catch (err) {
@@ -199,8 +199,7 @@ export default function Users() {
                   onChange={(e) => setCreateForm((p) => ({ ...p, role: e.target.value }))}
                   className="w-full rounded-xl border border-zinc-200 bg-white px-4 py-3 text-sm outline-none transition focus:border-zinc-400 focus:ring-4 focus:ring-zinc-100"
                 >
-                  <option>Viewer</option>
-                  <option>Editor</option>
+                  <option>User</option>
                   <option>Admin</option>
                 </select>
               </label>
@@ -276,14 +275,14 @@ export default function Users() {
                             onClick={() => onEditUser(user)}
                             className="rounded-lg border border-zinc-200 px-2 py-1 text-xs text-zinc-700 hover:bg-zinc-100"
                           >
-                            Edit
+                            Switch Role
                           </button>
                           <button
                             type="button"
                             onClick={() => onToggleStatus(user)}
                             className="rounded-lg border border-zinc-200 px-2 py-1 text-xs text-zinc-700 hover:bg-zinc-100"
                           >
-                            Toggle Status
+                            Change Status
                           </button>
                           <button
                             type="button"

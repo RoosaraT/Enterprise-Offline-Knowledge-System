@@ -1,6 +1,8 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import Button from "../components/Button.jsx";
+import whiteBin from "../assets/white-bin.png";
+import blackBin from "../assets/black-bin.png";
 
 export default function UserChat() {
   const nav = useNavigate();
@@ -78,7 +80,7 @@ export default function UserChat() {
           setMessages([
             {
               role: "assistant",
-              text: "Hi. Ask me anything about your uploaded documents.",
+              text: "Hi. Ask me anything about uploaded documents.",
             },
           ]);
         } else {
@@ -226,6 +228,33 @@ export default function UserChat() {
     }
   }
 
+  async function deleteChat(sessionId) {
+    setStatusMsg("");
+    setErrorMsg("");
+    try {
+      const token = localStorage.getItem("auth_token");
+      const res = await fetch(`/api/chat/sessions/${sessionId}`, {
+        method: "DELETE",
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data?.error || "Delete failed");
+
+      const nextSessions = sessions.filter((s) => s.id !== sessionId);
+      setSessions(nextSessions);
+
+      if (sessionId === activeSessionId) {
+        if (nextSessions.length > 0) {
+          setActiveSessionId(nextSessions[0].id);
+        } else {
+          await createNewSession();
+        }
+      }
+    } catch (err) {
+      setErrorMsg(err?.message || "Delete failed.");
+    }
+  }
+
   async function onSaveSettings(e) {
     e.preventDefault();
     setStatusMsg("");
@@ -269,21 +298,44 @@ export default function UserChat() {
                 <div className="rounded-lg border border-zinc-200 px-3 py-2 text-xs text-zinc-500">No chats yet</div>
               ) : (
                 sessions.map((chat) => (
-                  <button
+                  <div
                     key={chat.id}
-                    type="button"
+                    role="button"
+                    tabIndex={0}
                     onClick={() => {
                       setActiveSessionId(chat.id);
                       setPanel("chat");
                     }}
-                    className={`block w-full rounded-lg border px-3 py-2 text-left text-sm transition ${
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" || e.key === " ") {
+                        setActiveSessionId(chat.id);
+                        setPanel("chat");
+                      }
+                    }}
+                    className={`group relative block w-full rounded-lg border px-3 py-2 text-left text-sm transition ${
                       chat.id === activeSessionId
                         ? "border-zinc-900 bg-zinc-900 text-white"
                         : "border-zinc-200 bg-white text-zinc-700 hover:bg-zinc-50"
                     }`}
                   >
-                    <div className="truncate">{chat.title}</div>
-                  </button>
+                    <div className="truncate pr-7">{chat.title}</div>
+                    <button
+                      type="button"
+                      aria-label={`Delete ${chat.title}`}
+                      title="Delete chat"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        void deleteChat(chat.id);
+                      }}
+                      className="absolute right-2 top-1/2 hidden -translate-y-1/2 rounded p-1 group-hover:block"
+                    >
+                      <img
+                        src={chat.id === activeSessionId ? whiteBin : blackBin}
+                        alt=""
+                        className="h-4 w-4"
+                      />
+                    </button>
+                  </div>
                 ))
               )}
             </div>

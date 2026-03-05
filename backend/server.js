@@ -65,7 +65,7 @@ db.exec(`
 // Add user profile columns if missing (SQLite lacks IF NOT EXISTS for columns)
 try { db.exec(`ALTER TABLE users ADD COLUMN name TEXT`); } catch {}
 try { db.exec(`ALTER TABLE users ADD COLUMN username TEXT`); } catch {}
-try { db.exec(`ALTER TABLE users ADD COLUMN role TEXT DEFAULT 'Viewer'`); } catch {}
+try { db.exec(`ALTER TABLE users ADD COLUMN role TEXT DEFAULT 'User'`); } catch {}
 try { db.exec(`ALTER TABLE users ADD COLUMN status TEXT DEFAULT 'Active'`); } catch {}
 
 db.exec(`
@@ -106,6 +106,35 @@ db.exec(`
   );
 `);
 
+// Per-user learning telemetry used for adaptive content generation and difficulty tuning.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS learning_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    session_id TEXT,
+    message_id INTEGER,
+    event_type TEXT NOT NULL,
+    topic TEXT,
+    learning_style TEXT,
+    detected_difficulty REAL,
+    target_difficulty REAL,
+    confidence REAL,
+    engagement_score REAL,
+    correctness_score REAL,
+    response_time_ms INTEGER,
+    hints_used INTEGER DEFAULT 0,
+    attempt_count INTEGER DEFAULT 1,
+    source_doc_count INTEGER DEFAULT 0,
+    model_name TEXT,
+    model_temperature REAL,
+    metadata_json TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+`);
+
+db.exec(`CREATE INDEX IF NOT EXISTS idx_learning_events_user_time ON learning_events(user_id, created_at);`);
+db.exec(`CREATE INDEX IF NOT EXISTS idx_learning_events_session_time ON learning_events(session_id, created_at);`);
+
 // -------------------- Auth middleware --------------------
 function requireAuth(req, res, next) {
   const auth = req.headers.authorization || "";
@@ -121,7 +150,8 @@ function requireAuth(req, res, next) {
 }
 
 function requireAdmin(req, res, next) {
-  if (req.user?.email !== "admin@company.com") return res.status(403).json({ error: "Admin only" });
+  const user = db.prepare("SELECT role FROM users WHERE id = ?").get(req.user?.sub);
+  if (!user || user.role !== "Admin") return res.status(403).json({ error: "Admin only" });
   return next();
 }
 
@@ -157,6 +187,44 @@ async function ollamaGenerate(prompt) {
 
   const data = await res.json();
   return data?.response ?? "";
+}
+
+async function expandQueriesForRetrieval(inputQuery) {
+  const base = String(inputQuery || "").trim();
+  if (!base) return [];
+
+  const prompt = `You are a translation helper.
+Return ONLY valid JSON with two keys:
+{"english":"...","sinhala":"..."}
+Rules:
+- Keep meaning exact.
+- If input is already English, english should match it naturally.
+- If input is already Sinhala, sinhala should match it naturally.
+- No markdown, no extra text.
+
+Input:
+${base}`;
+
+  try {
+    const raw = await ollamaGenerate(prompt);
+    const jsonMatch = String(raw).match(/\{[\s\S]*\}/);
+    const parsed = JSON.parse(jsonMatch ? jsonMatch[0] : raw);
+    const english = String(parsed?.english || "").trim();
+    const sinhala = String(parsed?.sinhala || "").trim();
+    const candidates = [base, english, sinhala].filter(Boolean);
+    const seen = new Set();
+    const unique = [];
+    for (const c of candidates) {
+      const key = c.toLowerCase();
+      if (!seen.has(key)) {
+        seen.add(key);
+        unique.push(c);
+      }
+    }
+    return unique;
+  } catch {
+    return [base];
+  }
 }
 
 function chunkText(text, maxChars = 1200, overlap = 150) {
@@ -195,6 +263,12 @@ function setSetting(key, value) {
   db.prepare(
     "INSERT INTO app_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
   ).run(key, String(value));
+}
+
+function normalizeRole(role) {
+  const r = String(role || "").trim().toLowerCase();
+  if (r === "admin") return "Admin";
+  return "User";
 }
 
 // -------------------- Session DB (temporary per user) --------------------
@@ -277,12 +351,22 @@ if (count === 0) {
   console.log("Created default user:", email, "password:", pass);
 }
 
+// Normalize legacy roles to User/Admin
+db.prepare(
+  `UPDATE users
+   SET role = CASE
+     WHEN lower(role) = 'admin' THEN 'Admin'
+     ELSE 'User'
+   END
+   WHERE role IS NOT NULL`
+).run();
+
 // -------------------- Routes --------------------
 
 // Register (optional)
 app.post("/api/register", async (req, res) => {
   try {
-    let { email, password, name, username, role } = req.body || {};
+    let { email, password, name, username } = req.body || {};
     if (!email && username) email = `${String(username).trim()}@local`;
     const allowRegistrations = getSetting("allow_registrations", "true") === "true";
     if (!allowRegistrations) {
@@ -293,12 +377,11 @@ app.post("/api/register", async (req, res) => {
     }
     const safeName = name ? String(name).trim() : null;
     const safeUsername = username ? String(username).trim() : null;
-    const defaultRole = getSetting("default_user_role", "Viewer");
-    const safeRole = role ? String(role).trim() : defaultRole;
+    const defaultRole = normalizeRole(getSetting("default_user_role", "User"));
     const password_hash = await bcrypt.hash(password, 10);
     db.prepare(
       "INSERT INTO users (email, password_hash, name, username, role, status) VALUES (?, ?, ?, ?, ?, ?)"
-    ).run(email, password_hash, safeName, safeUsername, safeRole, "Active");
+    ).run(email, password_hash, safeName, safeUsername, defaultRole, "Active");
     return res.json({ ok: true });
   } catch (e) {
     if (String(e).includes("UNIQUE")) return res.status(409).json({ error: "User already exists" });
@@ -342,7 +425,7 @@ app.patch("/api/users/:id", requireAuth, requireAdmin, (req, res) => {
   const user = db.prepare("SELECT id FROM users WHERE id = ?").get(id);
   if (!user) return res.status(404).json({ error: "User not found" });
 
-  const nextRole = role ? String(role).trim() : null;
+  const nextRole = role ? normalizeRole(role) : null;
   const nextStatus = status ? String(status).trim() : null;
   const nextName = name ? String(name).trim() : null;
 
@@ -373,7 +456,7 @@ app.post("/api/users", requireAuth, requireAdmin, async (req, res) => {
     }
     const safeName = name ? String(name).trim() : null;
     const safeUsername = username ? String(username).trim() : null;
-    const safeRole = role ? String(role).trim() : "Viewer";
+    const safeRole = normalizeRole(role || "User");
     const safeStatus = status ? String(status).trim() : "Active";
     const password_hash = await bcrypt.hash(String(password), 10);
     db.prepare(
@@ -393,7 +476,7 @@ app.post("/api/users", requireAuth, requireAdmin, async (req, res) => {
 app.get("/api/settings", requireAuth, requireAdmin, (req, res) => {
   const settings = {
     org_name: getSetting("org_name", "Enterprise Offline Knowledge System"),
-    default_user_role: getSetting("default_user_role", "Viewer"),
+    default_user_role: normalizeRole(getSetting("default_user_role", "User")),
     allow_registrations: getSetting("allow_registrations", "true") === "true",
   };
   res.json(settings);
@@ -402,7 +485,7 @@ app.get("/api/settings", requireAuth, requireAdmin, (req, res) => {
 app.put("/api/settings", requireAuth, requireAdmin, (req, res) => {
   const { org_name, default_user_role, allow_registrations } = req.body || {};
   if (org_name) setSetting("org_name", String(org_name).trim());
-  if (default_user_role) setSetting("default_user_role", String(default_user_role).trim());
+  if (default_user_role) setSetting("default_user_role", normalizeRole(default_user_role));
   if (allow_registrations !== undefined) setSetting("allow_registrations", String(Boolean(allow_registrations)));
   res.json({ ok: true });
 });
@@ -557,12 +640,14 @@ app.post("/api/ask", requireAuth, async (req, res) => {
       return res.json({ answer: "No content found, try something else.", citations: [] });
     }
 
-    const qEmb = await ollamaEmbed(question.trim());
+    const queryVariants = await expandQueriesForRetrieval(question.trim());
+    const queryEmbeddings = await Promise.all(queryVariants.map((q) => ollamaEmbed(q)));
 
     const scored = rows
       .map((r) => {
         const emb = JSON.parse(r.embedding_json);
-        return { file: r.file_name, location: r.location, content: r.content, score: cosineSim(qEmb, emb) };
+        const score = queryEmbeddings.reduce((best, qEmb) => Math.max(best, cosineSim(qEmb, emb)), -Infinity);
+        return { file: r.file_name, location: r.location, content: r.content, score };
       })
       .sort((a, b) => b.score - a.score)
       .slice(0, Math.max(1, Math.min(12, topK)));
@@ -644,12 +729,14 @@ app.post("/api/chat", requireAuth, async (req, res) => {
       return res.json({ reply, citations: [], sources: [], sessionId: activeSessionId });
     }
 
-    const qEmb = await ollamaEmbed(message.trim());
+    const queryVariants = await expandQueriesForRetrieval(message.trim());
+    const queryEmbeddings = await Promise.all(queryVariants.map((q) => ollamaEmbed(q)));
 
     const scored = rows
       .map((r) => {
         const emb = JSON.parse(r.embedding_json);
-        return { file: r.file_name, location: r.location, content: r.content, score: cosineSim(qEmb, emb) };
+        const score = queryEmbeddings.reduce((best, qEmb) => Math.max(best, cosineSim(qEmb, emb)), -Infinity);
+        return { file: r.file_name, location: r.location, content: r.content, score };
       })
       .sort((a, b) => b.score - a.score)
       .slice(0, Math.max(1, Math.min(12, topK)));
@@ -721,6 +808,15 @@ app.patch("/api/chat/sessions/:id", requireAuth, (req, res) => {
   sdb.prepare(`UPDATE chat_sessions SET title = ? WHERE id = ?`).run(safeTitle.slice(0, 80), req.params.id);
   const updated = sdb.prepare(`SELECT id, title, created_at FROM chat_sessions WHERE id = ?`).get(req.params.id);
   res.json({ session: updated });
+});
+
+app.delete("/api/chat/sessions/:id", requireAuth, (req, res) => {
+  const sdb = ensureSessionDb(req.user.sub);
+  const existing = sdb.prepare(`SELECT id FROM chat_sessions WHERE id = ?`).get(req.params.id);
+  if (!existing) return res.status(404).json({ error: "Session not found" });
+  sdb.prepare(`DELETE FROM messages WHERE session_id = ?`).run(req.params.id);
+  sdb.prepare(`DELETE FROM chat_sessions WHERE id = ?`).run(req.params.id);
+  res.json({ ok: true });
 });
 
 app.get("/api/chat/sessions/:id/messages", requireAuth, (req, res) => {

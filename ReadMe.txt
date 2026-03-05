@@ -4,12 +4,15 @@ Linux server (Ubuntu 22.04 recommended)
 Node.js 20+
 Ollama installed
 Ports: 80/443 for web, 3001 for backend (or proxy)
+
+
 2) Install Ollama + models
 
 # install Ollama (see official installer)
 ollama pull llama3.1:8b
 ollama pull nomic-embed-text
 Make sure Ollama is running on http://localhost:11434.
+
 
 3) Backend setup
 
@@ -20,10 +23,12 @@ Set env vars (example):
 JWT_SECRET=change-this
 FRONTEND_ORIGIN=http://your-domain-or-ip
 OLLAMA_BASE=http://localhost:11434
+
 Start backend:
 
 node server.js
 (Production: use pm2 or systemd.)
+
 
 4) Frontend setup
 
@@ -32,10 +37,13 @@ npm install
 npm run build
 Serve local-doc-ai-frontend/dist with a web server.
 
+
 5) Reverse proxy (nginx example)
 
 Serve frontend from / (static)
 Proxy /api → http://localhost:3001
+
+
 6) Data persistence
 Keep these folders backed up:
 

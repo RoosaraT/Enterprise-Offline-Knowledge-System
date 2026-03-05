@@ -1,5 +1,5 @@
 // src/pages/Dashboard.jsx
-import React, { useMemo, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import Button from "../components/Button.jsx";
 import AdminSidebar from "../components/AdminSidebar.jsx";
 
@@ -55,6 +55,34 @@ export default function Dashboard() {
     if (!res.ok) throw new Error(data?.error || `Upload failed (${res.status})`);
     return data;
   }
+
+  async function loadDocuments() {
+    setErrorMsg("");
+    try {
+      const token = getTokenOrThrow();
+      const res = await fetch("/api/files", {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data?.error || `Load failed (${res.status})`);
+
+      const mapped = (data?.files || []).map((row) => ({
+        id: `db-${row.id}`,
+        name: row.original_name,
+        type: typeFromName(row.original_name),
+        date: row.uploaded_at,
+        size: row.size_bytes || 0,
+        status: "Indexed",
+      }));
+      setDocuments(mapped);
+    } catch (err) {
+      setErrorMsg(err?.message || "Failed to load documents");
+    }
+  }
+
+  useEffect(() => {
+    loadDocuments();
+  }, []);
 
   async function onUploadSelected(fileList) {
     const files = Array.from(fileList || []);

@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from "react";
 import AdminSidebar from "../components/AdminSidebar.jsx";
 import Button from "../components/Button.jsx";
+import { apiFetch } from "../lib/auth.js";
 
 export default function Settings() {
   const [orgName, setOrgName] = useState("Enterprise Offline Knowledge System");
@@ -13,10 +14,7 @@ export default function Settings() {
     async function loadSettings() {
       setErrorMsg("");
       try {
-        const token = localStorage.getItem("auth_token");
-        const res = await fetch("/api/settings", {
-          headers: { Authorization: `Bearer ${token}` },
-        });
+        const res = await apiFetch("/api/settings");
         const data = await res.json().catch(() => ({}));
         if (!res.ok) throw new Error(data?.error || "Failed to load settings");
         setOrgName(data?.org_name || "Enterprise Offline Knowledge System");
@@ -34,12 +32,10 @@ export default function Settings() {
     setStatusMsg("");
     setErrorMsg("");
     try {
-      const token = localStorage.getItem("auth_token");
-      const res = await fetch("/api/settings", {
+      const res = await apiFetch("/api/settings", {
         method: "PUT",
         headers: {
           "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
         },
         body: JSON.stringify({
           org_name: orgName,

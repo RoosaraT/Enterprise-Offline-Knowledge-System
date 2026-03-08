@@ -9,6 +9,7 @@ import path from "path";
 import fs from "fs";
 import { execFile } from "child_process";
 import { fileURLToPath } from "url";
+import crypto from "crypto";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -23,6 +24,15 @@ console.log("PDF script exists:", fs.existsSync(PDF_EXTRACT_SCRIPT));
 const PORT = 3001;
 const JWT_SECRET = process.env.JWT_SECRET || "change-this-secret-in-env";
 const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || "http://localhost:5176";
+const COOKIE_NAME = "eoks_session";
+const CSRF_COOKIE_NAME = "eoks_csrf";
+const COOKIE_MAX_AGE_MS = 8 * 60 * 60 * 1000;
+const IS_PRODUCTION = process.env.NODE_ENV === "production";
+const SESSION_RENEW_WINDOW_MS = 60 * 60 * 1000;
+const LOGIN_RATE_LIMIT_WINDOW_MS = 15 * 60 * 1000;
+const LOGIN_RATE_LIMIT_MAX = 10;
+const UPLOAD_RATE_LIMIT_WINDOW_MS = 10 * 60 * 1000;
+const UPLOAD_RATE_LIMIT_MAX = 30;
 
 // Ollama (local, offline after model download)
 const OLLAMA_BASE = process.env.OLLAMA_BASE || "http://localhost:11434";
@@ -48,7 +58,7 @@ const upload = multer({ storage });
 // -------------------- App --------------------
 const app = express();
 app.use(express.json());
-app.use(cors({ origin: FRONTEND_ORIGIN }));
+app.use(cors({ origin: FRONTEND_ORIGIN, credentials: true }));
 
 // -------------------- DB (permanent auth + file metadata) --------------------
 const db = new Database(path.join(__dirname, "./auth.db"));
@@ -135,18 +145,275 @@ db.exec(`
 db.exec(`CREATE INDEX IF NOT EXISTS idx_learning_events_user_time ON learning_events(user_id, created_at);`);
 db.exec(`CREATE INDEX IF NOT EXISTS idx_learning_events_session_time ON learning_events(session_id, created_at);`);
 
-// -------------------- Auth middleware --------------------
-function requireAuth(req, res, next) {
-  const auth = req.headers.authorization || "";
-  const token = auth.startsWith("Bearer ") ? auth.slice(7) : null;
-  if (!token) return res.status(401).json({ error: "Missing token" });
+db.exec(`
+  CREATE TABLE IF NOT EXISTS auth_sessions (
+    id TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL,
+    csrf_token TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    last_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
+    expires_at TEXT NOT NULL,
+    revoked_at TEXT
+  );
+`);
 
+db.exec(`CREATE INDEX IF NOT EXISTS idx_auth_sessions_user ON auth_sessions(user_id, created_at DESC);`);
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS audit_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    action TEXT NOT NULL,
+    target_type TEXT,
+    target_id TEXT,
+    metadata_json TEXT,
+    ip_address TEXT,
+    user_agent TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+`);
+
+db.exec(`CREATE INDEX IF NOT EXISTS idx_audit_logs_user_time ON audit_logs(user_id, created_at DESC);`);
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS rate_limits (
+    key TEXT PRIMARY KEY,
+    count INTEGER NOT NULL,
+    reset_at TEXT NOT NULL
+  );
+`);
+
+db.exec(`CREATE INDEX IF NOT EXISTS idx_rate_limits_reset_at ON rate_limits(reset_at);`);
+
+// -------------------- Auth middleware --------------------
+function parseCookies(req) {
+  const raw = req.headers.cookie || "";
+  return raw
+    .split(";")
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .reduce((acc, part) => {
+      const eq = part.indexOf("=");
+      if (eq === -1) return acc;
+      const key = part.slice(0, eq).trim();
+      const value = part.slice(eq + 1).trim();
+      acc[key] = decodeURIComponent(value);
+      return acc;
+    }, {});
+}
+
+function setSessionCookies(res, token, csrfToken) {
+  res.cookie(COOKIE_NAME, token, {
+    httpOnly: true,
+    sameSite: "lax",
+    secure: IS_PRODUCTION,
+    path: "/",
+    maxAge: COOKIE_MAX_AGE_MS,
+  });
+  res.cookie(CSRF_COOKIE_NAME, csrfToken, {
+    httpOnly: false,
+    sameSite: "lax",
+    secure: IS_PRODUCTION,
+    path: "/",
+    maxAge: COOKIE_MAX_AGE_MS,
+  });
+}
+
+function clearSessionCookies(res) {
+  res.clearCookie(COOKIE_NAME, {
+    httpOnly: true,
+    sameSite: "lax",
+    secure: IS_PRODUCTION,
+    path: "/",
+  });
+  res.clearCookie(CSRF_COOKIE_NAME, {
+    httpOnly: false,
+    sameSite: "lax",
+    secure: IS_PRODUCTION,
+    path: "/",
+  });
+}
+
+function isoFromNow(ms) {
+  return new Date(Date.now() + ms).toISOString();
+}
+
+function createAuthSession(userId) {
+  const sessionId = crypto.randomUUID();
+  const csrfToken = crypto.randomBytes(24).toString("hex");
+  db.prepare(
+    `INSERT INTO auth_sessions (id, user_id, csrf_token, expires_at)
+     VALUES (?, ?, ?, ?)`
+  ).run(sessionId, userId, csrfToken, isoFromNow(COOKIE_MAX_AGE_MS));
+  return { sessionId, csrfToken };
+}
+
+function revokeAuthSession(sessionId) {
+  if (!sessionId) return;
+  db.prepare(`UPDATE auth_sessions SET revoked_at = datetime('now') WHERE id = ? AND revoked_at IS NULL`).run(sessionId);
+}
+
+function revokeUserSessions(userId) {
+  if (!userId) return;
+  db.prepare(`UPDATE auth_sessions SET revoked_at = datetime('now') WHERE user_id = ? AND revoked_at IS NULL`).run(userId);
+}
+
+function issueSession(res, user) {
+  const { sessionId, csrfToken } = createAuthSession(user.id);
+  const token = jwt.sign({ sub: user.id, email: user.email, sid: sessionId }, JWT_SECRET, { expiresIn: "8h" });
+  setSessionCookies(res, token, csrfToken);
+  return { sessionId, csrfToken, token };
+}
+
+function maybeRenewSession(req, res, sessionRow) {
+  const expiresAtMs = new Date(sessionRow.expires_at).getTime();
+  if (!Number.isFinite(expiresAtMs) || expiresAtMs - Date.now() > SESSION_RENEW_WINDOW_MS) return;
+  db.prepare(`UPDATE auth_sessions SET expires_at = ?, last_seen_at = datetime('now') WHERE id = ?`).run(
+    isoFromNow(COOKIE_MAX_AGE_MS),
+    sessionRow.id,
+  );
+  const token = jwt.sign({ sub: req.user.sub, email: req.user.email, sid: sessionRow.id }, JWT_SECRET, { expiresIn: "8h" });
+  setSessionCookies(res, token, sessionRow.csrf_token);
+}
+
+function audit(req, action, details = {}) {
+  const {
+    userId = req.user?.sub || null,
+    targetType = null,
+    targetId = null,
+    metadata = null,
+  } = details;
+  db.prepare(
+    `INSERT INTO audit_logs (user_id, action, target_type, target_id, metadata_json, ip_address, user_agent)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    userId,
+    action,
+    targetType,
+    targetId == null ? null : String(targetId),
+    metadata ? JSON.stringify(metadata) : null,
+    req.ip || null,
+    req.headers["user-agent"] || null,
+  );
+}
+
+function checkRateLimit(bucketKey, windowMs, maxRequests) {
+  const now = Date.now();
+  const current = db.prepare("SELECT count, reset_at FROM rate_limits WHERE key = ?").get(bucketKey);
+
+  if (!current || new Date(current.reset_at).getTime() <= now) {
+    const resetAt = isoFromNow(windowMs);
+    db.prepare(
+      `INSERT INTO rate_limits (key, count, reset_at)
+       VALUES (?, ?, ?)
+       ON CONFLICT(key) DO UPDATE SET count = excluded.count, reset_at = excluded.reset_at`
+    ).run(bucketKey, 1, resetAt);
+    return {
+      allowed: true,
+      remaining: Math.max(0, maxRequests - 1),
+      retryAfterMs: windowMs,
+    };
+  }
+
+  const nextCount = current.count + 1;
+  db.prepare("UPDATE rate_limits SET count = ? WHERE key = ?").run(nextCount, bucketKey);
+  return {
+    allowed: nextCount <= maxRequests,
+    remaining: Math.max(0, maxRequests - nextCount),
+    retryAfterMs: Math.max(0, new Date(current.reset_at).getTime() - now),
+  };
+}
+
+function rateLimit({ key, windowMs, maxRequests }) {
+  return (req, res, next) => {
+    const bucket = `${key}:${req.ip || "unknown"}`;
+    const verdict = checkRateLimit(bucket, windowMs, maxRequests);
+    res.setHeader("X-RateLimit-Limit", String(maxRequests));
+    res.setHeader("X-RateLimit-Remaining", String(verdict.remaining));
+    if (!verdict.allowed) {
+      res.setHeader("Retry-After", String(Math.ceil(verdict.retryAfterMs / 1000)));
+      return res.status(429).json({ error: "Too many requests. Please try again later." });
+    }
+    return next();
+  };
+}
+
+function getSessionToken(req) {
+  const auth = req.headers.authorization || "";
+  const bearerToken = auth.startsWith("Bearer ") ? auth.slice(7) : null;
+  const cookieToken = parseCookies(req)[COOKIE_NAME] || null;
+  return cookieToken || bearerToken;
+}
+
+function readAuth(req) {
+  const token = getSessionToken(req);
+  if (!token) return null;
+
+  const payload = jwt.verify(token, JWT_SECRET);
+  const sessionId = payload?.sid || null;
+  if (!sessionId) return null;
+
+  const session = db.prepare(
+    `SELECT id, user_id, csrf_token, expires_at, revoked_at
+     FROM auth_sessions
+     WHERE id = ?`
+  ).get(sessionId);
+
+  if (!session || session.user_id !== payload.sub || session.revoked_at) return null;
+  if (new Date(session.expires_at).getTime() <= Date.now()) {
+    revokeAuthSession(session.id);
+    return null;
+  }
+
+  return { payload, session };
+}
+
+function timingSafeEqualText(a, b) {
+  const aBuf = Buffer.from(String(a || ""), "utf8");
+  const bBuf = Buffer.from(String(b || ""), "utf8");
+  if (aBuf.length !== bBuf.length) return false;
+  return crypto.timingSafeEqual(aBuf, bBuf);
+}
+
+function requireAuth(req, res, next) {
   try {
-    req.user = jwt.verify(token, JWT_SECRET); // { sub, email, ... }
+    const auth = readAuth(req);
+    if (!auth) {
+      clearSessionCookies(res);
+      return res.status(401).json({ error: "Invalid session" });
+    }
+    req.user = auth.payload;
+    req.session = auth.session;
+    const currentUser = db.prepare("SELECT id, email, role, status FROM users WHERE id = ?").get(auth.payload.sub);
+    if (!currentUser || currentUser.status !== "Active") {
+      revokeAuthSession(auth.session.id);
+      clearSessionCookies(res);
+      return res.status(403).json({ error: "Account is not active" });
+    }
+    req.currentUser = currentUser;
+    db.prepare(`UPDATE auth_sessions SET last_seen_at = datetime('now') WHERE id = ?`).run(auth.session.id);
+    maybeRenewSession(req, res, auth.session);
     return next();
   } catch {
-    return res.status(401).json({ error: "Invalid token" });
+    clearSessionCookies(res);
+    return res.status(401).json({ error: "Invalid session" });
   }
+}
+
+function requireCsrf(req, res, next) {
+  if (["GET", "HEAD", "OPTIONS"].includes(req.method)) return next();
+  if (req.path === "/api/login" || req.path === "/api/register" || req.path === "/api/health") return next();
+  const cookies = parseCookies(req);
+  const cookieToken = cookies[CSRF_COOKIE_NAME] || "";
+  const headerToken = req.headers["x-csrf-token"] || "";
+  const sessionToken = req.session?.csrf_token || "";
+  if (!cookieToken || !headerToken || !sessionToken) {
+    return res.status(403).json({ error: "CSRF validation failed" });
+  }
+  if (!timingSafeEqualText(cookieToken, headerToken) || !timingSafeEqualText(cookieToken, sessionToken)) {
+    return res.status(403).json({ error: "CSRF validation failed" });
+  }
+  return next();
 }
 
 function requireAdmin(req, res, next) {
@@ -416,6 +683,13 @@ app.post("/api/register", async (req, res) => {
     db.prepare(
       "INSERT INTO users (email, password_hash, name, username, role, status) VALUES (?, ?, ?, ?, ?, ?)"
     ).run(email, password_hash, safeName, safeUsername, defaultRole, "Active");
+    const created = db.prepare("SELECT id FROM users WHERE email = ?").get(email);
+    audit(req, "auth.register", {
+      userId: created?.id || null,
+      targetType: "user",
+      targetId: created?.id || null,
+      metadata: { email },
+    });
     return res.json({ ok: true });
   } catch (e) {
     if (String(e).includes("UNIQUE")) return res.status(409).json({ error: "User already exists" });
@@ -424,25 +698,109 @@ app.post("/api/register", async (req, res) => {
 });
 
 // Login
-app.post("/api/login", async (req, res) => {
+app.post("/api/login", rateLimit({ key: "login", windowMs: LOGIN_RATE_LIMIT_WINDOW_MS, maxRequests: LOGIN_RATE_LIMIT_MAX }), async (req, res) => {
   const { email, password } = req.body || {};
   if (!email || !password) return res.status(400).json({ error: "Email and password required" });
 
   const user = db.prepare("SELECT * FROM users WHERE email = ?").get(email);
-  if (!user) return res.status(401).json({ error: "Invalid credentials" });
-  if (user.status && user.status !== "Active") return res.status(403).json({ error: "User is suspended" });
+  if (!user) {
+    audit(req, "auth.login_failed", { metadata: { email, reason: "user_not_found" } });
+    return res.status(401).json({ error: "Invalid credentials" });
+  }
+  if (user.status && user.status !== "Active") {
+    audit(req, "auth.login_failed", { userId: user.id, metadata: { email, reason: "suspended" } });
+    return res.status(403).json({ error: "User is suspended" });
+  }
 
   const ok = await bcrypt.compare(password, user.password_hash);
-  if (!ok) return res.status(401).json({ error: "Invalid credentials" });
+  if (!ok) {
+    audit(req, "auth.login_failed", { userId: user.id, metadata: { email, reason: "bad_password" } });
+    return res.status(401).json({ error: "Invalid credentials" });
+  }
 
-  const token = jwt.sign({ sub: user.id, email: user.email }, JWT_SECRET, { expiresIn: "8h" });
-  return res.json({ token, role: user.role });
+  const { sessionId } = issueSession(res, user);
+  audit(req, "auth.login", {
+    userId: user.id,
+    targetType: "session",
+    targetId: sessionId,
+    metadata: { role: user.role },
+  });
+  return res.json({
+    ok: true,
+    user: {
+      id: user.id,
+      email: user.email,
+      name: user.name,
+      username: user.username,
+      role: user.role,
+      status: user.status,
+      created_at: user.created_at,
+    },
+  });
+});
+
+app.post("/api/logout", requireAuth, requireCsrf, (req, res) => {
+  revokeAuthSession(req.session?.id);
+  audit(req, "auth.logout", {
+    targetType: "session",
+    targetId: req.session?.id,
+  });
+  clearSessionCookies(res);
+  res.json({ ok: true });
 });
 
 // Me
 app.get("/api/me", requireAuth, (req, res) => {
   const user = db.prepare("SELECT id, email, name, username, role, status, created_at FROM users WHERE id = ?").get(req.user.sub);
   res.json(user || { id: req.user.sub, email: req.user.email });
+});
+
+app.get("/api/audit-logs", requireAuth, requireAdmin, (req, res) => {
+  const limit = Math.max(1, Math.min(200, Number(req.query.limit) || 100));
+  const actionFilter = String(req.query.action || "").trim();
+  const actorFilter = String(req.query.actor || "").trim().toLowerCase();
+  const queryFilter = String(req.query.q || "").trim().toLowerCase();
+  const rows = db.prepare(`
+    SELECT
+      audit_logs.id,
+      audit_logs.action,
+      audit_logs.target_type,
+      audit_logs.target_id,
+      audit_logs.metadata_json,
+      audit_logs.ip_address,
+      audit_logs.user_agent,
+      audit_logs.created_at,
+      users.email AS actor_email
+    FROM audit_logs
+    LEFT JOIN users ON users.id = audit_logs.user_id
+    ORDER BY audit_logs.created_at DESC, audit_logs.id DESC
+    LIMIT ?
+  `).all(limit);
+  const filtered = rows.filter((row) => {
+    if (actionFilter && row.action !== actionFilter) return false;
+    if (actorFilter && !String(row.actor_email || "").toLowerCase().includes(actorFilter)) return false;
+    if (queryFilter) {
+      const haystack = [
+        row.action,
+        row.target_type,
+        row.target_id,
+        row.actor_email,
+        row.ip_address,
+        row.metadata_json,
+      ]
+        .filter(Boolean)
+        .join(" ")
+        .toLowerCase();
+      if (!haystack.includes(queryFilter)) return false;
+    }
+    return true;
+  });
+  res.json({
+    logs: filtered.map((row) => ({
+      ...row,
+      metadata: row.metadata_json ? JSON.parse(row.metadata_json) : null,
+    })),
+  });
 });
 
 // Admin users management
@@ -453,7 +811,7 @@ app.get("/api/users", requireAuth, requireAdmin, (req, res) => {
   res.json({ users: rows });
 });
 
-app.patch("/api/users/:id", requireAuth, requireAdmin, (req, res) => {
+app.patch("/api/users/:id", requireAuth, requireCsrf, requireAdmin, (req, res) => {
   const id = Number(req.params.id);
   const { role, status, name } = req.body || {};
   const user = db.prepare("SELECT id FROM users WHERE id = ?").get(id);
@@ -470,18 +828,44 @@ app.patch("/api/users/:id", requireAuth, requireAdmin, (req, res) => {
     nextName || current.name,
     id
   );
+  const finalStatus = nextStatus || current.status;
+  if (finalStatus !== "Active") revokeUserSessions(id);
+  audit(req, "admin.user_updated", {
+    targetType: "user",
+    targetId: id,
+    metadata: {
+      role: nextRole || current.role,
+      status: nextStatus || current.status,
+      name: nextName || current.name,
+    },
+  });
   res.json({ ok: true });
 });
 
-app.delete("/api/users/:id", requireAuth, requireAdmin, (req, res) => {
+app.delete("/api/users/:id", requireAuth, requireCsrf, requireAdmin, (req, res) => {
   const id = Number(req.params.id);
   const user = db.prepare("SELECT id FROM users WHERE id = ?").get(id);
   if (!user) return res.status(404).json({ error: "User not found" });
+  revokeUserSessions(id);
   db.prepare("DELETE FROM users WHERE id = ?").run(id);
+  audit(req, "admin.user_deleted", { targetType: "user", targetId: id });
   res.json({ ok: true });
 });
 
-app.post("/api/users", requireAuth, requireAdmin, async (req, res) => {
+app.post("/api/users/:id/revoke-sessions", requireAuth, requireCsrf, requireAdmin, (req, res) => {
+  const id = Number(req.params.id);
+  const user = db.prepare("SELECT id, email FROM users WHERE id = ?").get(id);
+  if (!user) return res.status(404).json({ error: "User not found" });
+  revokeUserSessions(id);
+  audit(req, "admin.user_sessions_revoked", {
+    targetType: "user",
+    targetId: id,
+    metadata: { email: user.email },
+  });
+  res.json({ ok: true });
+});
+
+app.post("/api/users", requireAuth, requireCsrf, requireAdmin, async (req, res) => {
   try {
     let { email, password, name, username, role, status } = req.body || {};
     if (!email && username) email = `${String(username).trim()}@local`;
@@ -499,6 +883,11 @@ app.post("/api/users", requireAuth, requireAdmin, async (req, res) => {
     const user = db
       .prepare("SELECT id, name, username, email, role, status, created_at FROM users WHERE email = ?")
       .get(email);
+    audit(req, "admin.user_created", {
+      targetType: "user",
+      targetId: user?.id || null,
+      metadata: { email, role: safeRole, status: safeStatus },
+    });
     res.json({ user });
   } catch (e) {
     if (String(e).includes("UNIQUE")) return res.status(409).json({ error: "User already exists" });
@@ -516,11 +905,15 @@ app.get("/api/settings", requireAuth, requireAdmin, (req, res) => {
   res.json(settings);
 });
 
-app.put("/api/settings", requireAuth, requireAdmin, (req, res) => {
+app.put("/api/settings", requireAuth, requireCsrf, requireAdmin, (req, res) => {
   const { org_name, default_user_role, allow_registrations } = req.body || {};
   if (org_name) setSetting("org_name", String(org_name).trim());
   if (default_user_role) setSetting("default_user_role", normalizeRole(default_user_role));
   if (allow_registrations !== undefined) setSetting("allow_registrations", String(Boolean(allow_registrations)));
+  audit(req, "admin.settings_updated", {
+    targetType: "settings",
+    metadata: { org_name, default_user_role, allow_registrations },
+  });
   res.json({ ok: true });
 });
 
@@ -534,18 +927,23 @@ app.get("/api/user-settings", requireAuth, (req, res) => {
   res.json({ display_name: displayName, auto_scroll: autoScroll });
 });
 
-app.put("/api/user-settings", requireAuth, (req, res) => {
+app.put("/api/user-settings", requireAuth, requireCsrf, (req, res) => {
   const { display_name, auto_scroll } = req.body || {};
   const safeName = display_name ? String(display_name).trim() : null;
   const autoScroll = auto_scroll === undefined ? 1 : auto_scroll ? 1 : 0;
   db.prepare(
     "INSERT INTO user_settings (user_id, display_name, auto_scroll) VALUES (?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET display_name = excluded.display_name, auto_scroll = excluded.auto_scroll"
   ).run(req.user.sub, safeName, autoScroll);
+  audit(req, "user.settings_updated", {
+    targetType: "user_settings",
+    targetId: req.user.sub,
+    metadata: { display_name: safeName, auto_scroll: !!autoScroll },
+  });
   res.json({ ok: true });
 });
 
 // Upload + ingest (TXT + PDF)
-app.post("/api/upload", requireAuth, requireAdmin, upload.array("files", 50), async (req, res) => {
+app.post("/api/upload", requireAuth, requireCsrf, requireAdmin, rateLimit({ key: "upload", windowMs: UPLOAD_RATE_LIMIT_WINDOW_MS, maxRequests: UPLOAD_RATE_LIMIT_MAX }), upload.array("files", 50), async (req, res) => {
   try {
     const uploaded = req.files || [];
     const userId = req.user.sub;
@@ -619,6 +1017,10 @@ app.post("/api/upload", requireAuth, requireAdmin, upload.array("files", 50), as
       results.push({ id: fileId, name: f.originalname, size: f.size, type: f.mimetype });
     }
 
+    audit(req, "admin.files_uploaded", {
+      targetType: "file",
+      metadata: { count: results.length, files: results.map((r) => ({ id: r.id, name: r.name })) },
+    });
     res.json({ ok: true, uploaded: results });
   } catch (e) {
     res.status(500).json({ error: String(e.message || e) });
@@ -635,6 +1037,11 @@ app.get("/api/files/:id/view", requireAuth, requireAdmin, (req, res) => {
   const id = Number(req.params.id);
   const row = db.prepare("SELECT * FROM files WHERE id = ?").get(id);
   if (!row) return res.status(404).json({ error: "File not found" });
+  audit(req, "admin.file_viewed", {
+    targetType: "file",
+    targetId: id,
+    metadata: { name: row.original_name },
+  });
 
   const fullPath = path.join(uploadDir, row.stored_name);
   if (!fs.existsSync(fullPath)) return res.status(404).json({ error: "Stored file missing" });
@@ -644,7 +1051,7 @@ app.get("/api/files/:id/view", requireAuth, requireAdmin, (req, res) => {
   return res.sendFile(fullPath);
 });
 
-app.delete("/api/files/:id", requireAuth, requireAdmin, (req, res) => {
+app.delete("/api/files/:id", requireAuth, requireCsrf, requireAdmin, (req, res) => {
   const id = Number(req.params.id);
   const row = db.prepare("SELECT * FROM files WHERE id = ?").get(id);
   if (!row) return res.status(404).json({ error: "File not found" });
@@ -661,11 +1068,16 @@ app.delete("/api/files/:id", requireAuth, requireAdmin, (req, res) => {
     }
   }
 
+  audit(req, "admin.file_deleted", {
+    targetType: "file",
+    targetId: id,
+    metadata: { name: row.original_name },
+  });
   return res.json({ ok: true });
 });
 
 // Exact word/phrase search (fast, offline)
-app.post("/api/search", requireAuth, (req, res) => {
+app.post("/api/search", requireAuth, requireCsrf, (req, res) => {
   const { query, topK = 20 } = req.body || {};
   if (!query || !query.trim()) return res.status(400).json({ error: "Query required" });
 
@@ -697,7 +1109,7 @@ app.post("/api/search", requireAuth, (req, res) => {
 });
 
 // One-shot AI ask (context Q)
-app.post("/api/ask", requireAuth, async (req, res) => {
+app.post("/api/ask", requireAuth, requireCsrf, async (req, res) => {
   try {
     const { question, topK = 6 } = req.body || {};
     if (!question || !question.trim()) return res.status(400).json({ error: "Question required" });
@@ -758,7 +1170,7 @@ Answer only (short)
 });
 
 // Conversation chat (multi-turn)
-app.post("/api/chat", requireAuth, async (req, res) => {
+app.post("/api/chat", requireAuth, requireCsrf, async (req, res) => {
   try {
     const { message, topK = 6, sessionId } = req.body || {};
     if (!message || !message.trim()) return res.status(400).json({ error: "Message required" });
@@ -857,15 +1269,16 @@ app.get("/api/chat/sessions", requireAuth, (req, res) => {
   res.json({ sessions });
 });
 
-app.post("/api/chat/sessions", requireAuth, (req, res) => {
+app.post("/api/chat/sessions", requireAuth, requireCsrf, (req, res) => {
   const sdb = ensureSessionDb(req.user.sub);
   const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   sdb.prepare(`INSERT INTO chat_sessions (id, title) VALUES (?, ?)`).run(id, "New chat");
   const session = sdb.prepare(`SELECT id, title, created_at FROM chat_sessions WHERE id = ?`).get(id);
+  audit(req, "user.chat_session_created", { targetType: "chat_session", targetId: id });
   res.json({ session });
 });
 
-app.patch("/api/chat/sessions/:id", requireAuth, (req, res) => {
+app.patch("/api/chat/sessions/:id", requireAuth, requireCsrf, (req, res) => {
   const sdb = ensureSessionDb(req.user.sub);
   const { title } = req.body || {};
   const safeTitle = String(title || "").trim();
@@ -874,15 +1287,21 @@ app.patch("/api/chat/sessions/:id", requireAuth, (req, res) => {
   if (!session) return res.status(404).json({ error: "Session not found" });
   sdb.prepare(`UPDATE chat_sessions SET title = ? WHERE id = ?`).run(safeTitle.slice(0, 80), req.params.id);
   const updated = sdb.prepare(`SELECT id, title, created_at FROM chat_sessions WHERE id = ?`).get(req.params.id);
+  audit(req, "user.chat_session_renamed", {
+    targetType: "chat_session",
+    targetId: req.params.id,
+    metadata: { title: updated?.title || safeTitle.slice(0, 80) },
+  });
   res.json({ session: updated });
 });
 
-app.delete("/api/chat/sessions/:id", requireAuth, (req, res) => {
+app.delete("/api/chat/sessions/:id", requireAuth, requireCsrf, (req, res) => {
   const sdb = ensureSessionDb(req.user.sub);
   const existing = sdb.prepare(`SELECT id FROM chat_sessions WHERE id = ?`).get(req.params.id);
   if (!existing) return res.status(404).json({ error: "Session not found" });
   sdb.prepare(`DELETE FROM messages WHERE session_id = ?`).run(req.params.id);
   sdb.prepare(`DELETE FROM chat_sessions WHERE id = ?`).run(req.params.id);
+  audit(req, "user.chat_session_deleted", { targetType: "chat_session", targetId: req.params.id });
   res.json({ ok: true });
 });
 
@@ -906,10 +1325,11 @@ app.get("/api/chat/sessions/:id/export", requireAuth, (req, res) => {
 });
 
 // Clear session (forget everything indexed for this user)
-app.post("/api/session/clear", requireAuth, (req, res) => {
+app.post("/api/session/clear", requireAuth, requireCsrf, (req, res) => {
   const userId = req.user.sub;
   const dir = sessionDir(userId);
   if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
+  audit(req, "user.session_cleared", { targetType: "session", targetId: userId });
   res.json({ ok: true });
 });
 

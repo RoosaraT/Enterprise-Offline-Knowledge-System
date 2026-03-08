@@ -1,4 +1,4 @@
-import React from "react";
+import React, { useEffect, useState } from "react";
 import { Navigate, Route, Routes } from "react-router-dom";
 import Login from "./pages/Login.jsx";
 import Dashboard from "./pages/Dashboard.jsx";
@@ -6,13 +6,48 @@ import Register from "./pages/Register.jsx";
 import Users from "./pages/Users.jsx";
 import Settings from "./pages/Settings.jsx";
 import UserChat from "./pages/UserChat.jsx";
+import AuditLogs from "./pages/AuditLogs.jsx";
+import { apiFetch, cacheCurrentUser, clearClientSession, getCachedUser } from "./lib/auth.js";
 
-function isAuthed() {
-  return Boolean(localStorage.getItem("auth_token"));
-}
+function ProtectedRoute({ children, requiredRole }) {
+  const [loading, setLoading] = useState(true);
+  const [user, setUser] = useState(() => getCachedUser());
 
-function ProtectedRoute({ children }) {
-  if (!isAuthed()) return <Navigate to="/login" replace />;
+  useEffect(() => {
+    let alive = true;
+
+    async function verifySession() {
+      try {
+        const res = await apiFetch("/api/me");
+        if (!alive) return;
+        if (!res.ok) {
+          clearClientSession();
+          setUser(null);
+          return;
+        }
+
+        const data = await res.json().catch(() => null);
+        setUser(data || null);
+        cacheCurrentUser(data || null);
+      } catch {
+        clearClientSession();
+        setUser(null);
+      } finally {
+        if (alive) setLoading(false);
+      }
+    }
+
+    verifySession();
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  if (loading) return <div className="min-h-screen bg-zinc-50" />;
+  if (!user) return <Navigate to="/login" replace />;
+  if (requiredRole && user.role !== requiredRole) {
+    return <Navigate to={user.role === "Admin" ? "/app" : "/chat"} replace />;
+  }
   return children;
 }
 
@@ -25,7 +60,7 @@ export default function App() {
       <Route
         path="/app"
         element={
-          <ProtectedRoute>
+          <ProtectedRoute requiredRole="Admin">
             <Dashboard />
           </ProtectedRoute>
         }
@@ -33,7 +68,7 @@ export default function App() {
       <Route
         path="/users"
         element={
-          <ProtectedRoute>
+          <ProtectedRoute requiredRole="Admin">
             <Users />
           </ProtectedRoute>
         }
@@ -41,15 +76,23 @@ export default function App() {
       <Route
         path="/settings"
         element={
-          <ProtectedRoute>
+          <ProtectedRoute requiredRole="Admin">
             <Settings />
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/audit-logs"
+        element={
+          <ProtectedRoute requiredRole="Admin">
+            <AuditLogs />
           </ProtectedRoute>
         }
       />
       <Route
         path="/chat"
         element={
-          <ProtectedRoute>
+          <ProtectedRoute requiredRole="User">
             <UserChat />
           </ProtectedRoute>
         }

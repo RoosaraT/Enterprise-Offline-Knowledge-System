@@ -1,8 +1,9 @@
 // src/pages/Login.jsx
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import TextField from "../components/TextField.jsx";
 import Button from "../components/Button.jsx";
+import { apiFetch, cacheCurrentUser, clearClientSession } from "../lib/auth.js";
 
 const API_BASE = "http://localhost:3001"; // your local backend
 
@@ -17,13 +18,36 @@ export default function Login() {
 
   const canLogin = useMemo(() => email.trim().length > 0 && password.length >= 4, [email, password]);
 
+  useEffect(() => {
+    let alive = true;
+
+    async function redirectIfAuthenticated() {
+      try {
+        const res = await apiFetch("/api/me");
+        if (!alive || !res.ok) return;
+        const user = await res.json().catch(() => null);
+        if (!alive || !user) return;
+        const homeRoute = cacheCurrentUser(user);
+        nav(homeRoute, { replace: true });
+      } catch {
+        // Ignore and keep the login form visible.
+      }
+    }
+
+    redirectIfAuthenticated();
+    return () => {
+      alive = false;
+    };
+  }, [nav]);
+
   async function onSubmit(e) {
     e.preventDefault();
     setError("");
     setBusy(true);
+    clearClientSession();
 
     try {
-        const res = await fetch("/api/login", {
+        const res = await apiFetch("/api/login", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ email, password }),
@@ -36,26 +60,7 @@ export default function Login() {
         return;
         }
 
-        localStorage.setItem("auth_token", data.token);
-
-        let homeRoute = "/chat";
-        if (data?.role === "Admin" || email.trim().toLowerCase() === "admin@company.com") {
-          homeRoute = "/app";
-          localStorage.setItem("home_route", homeRoute);
-          nav(homeRoute, { replace: true });
-          return;
-        }
-        try {
-          const meRes = await fetch("/api/me", {
-            headers: { Authorization: `Bearer ${data.token}` },
-          });
-          const me = await meRes.json().catch(() => ({}));
-          if (meRes.ok && me?.role === "Admin") homeRoute = "/app";
-        } catch (meErr) {
-          if (email.trim().toLowerCase() === "admin@company.com") homeRoute = "/app";
-        }
-
-        localStorage.setItem("home_route", homeRoute);
+        const homeRoute = cacheCurrentUser(data?.user || null);
         nav(homeRoute, { replace: true });
     } catch (err) {
         setError("Cannot reach the login server. Is the backend running on port 3001?");

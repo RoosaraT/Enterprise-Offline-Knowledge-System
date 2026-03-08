@@ -1,6 +1,7 @@
 import React from "react";
 import { Link, useNavigate } from "react-router-dom";
 import Button from "./Button.jsx";
+import { logoutSession } from "../lib/auth.js";
 
 function navClass(active) {
   if (active) return "block w-full rounded-xl bg-zinc-900 px-3 py-2 text-left text-sm font-medium text-white";
@@ -10,9 +11,8 @@ function navClass(active) {
 export default function AdminSidebar({ active = "documents" }) {
   const nav = useNavigate();
 
-  function onLogout() {
-    localStorage.removeItem("auth_token");
-    localStorage.removeItem("home_route");
+  async function onLogout() {
+    await logoutSession();
     nav("/login", { replace: true });
   }
 
@@ -32,6 +32,9 @@ export default function AdminSidebar({ active = "documents" }) {
         </Link>
         <Link to="/settings" className={navClass(active === "settings")}>
           Settings
+        </Link>
+        <Link to="/audit-logs" className={navClass(active === "audit-logs")}>
+          Audit Logs
         </Link>
       </nav>
 

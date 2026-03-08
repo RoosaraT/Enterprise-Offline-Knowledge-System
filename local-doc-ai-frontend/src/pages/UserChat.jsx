@@ -3,6 +3,7 @@ import { useNavigate } from "react-router-dom";
 import Button from "../components/Button.jsx";
 import whiteBin from "../assets/white-bin.png";
 import blackBin from "../assets/black-bin.png";
+import { apiFetch, logoutSession } from "../lib/auth.js";
 
 export default function UserChat() {
   const nav = useNavigate();
@@ -28,10 +29,7 @@ export default function UserChat() {
     async function loadSessions() {
       setErrorMsg("");
       try {
-        const token = localStorage.getItem("auth_token");
-        const res = await fetch("/api/chat/sessions", {
-          headers: { Authorization: `Bearer ${token}` },
-        });
+        const res = await apiFetch("/api/chat/sessions");
         const data = await res.json().catch(() => ({}));
         if (!res.ok) throw new Error(data?.error || "Failed to load sessions");
         const list = data?.sessions || [];
@@ -49,10 +47,7 @@ export default function UserChat() {
     async function loadUserSettings() {
       setErrorMsg("");
       try {
-        const token = localStorage.getItem("auth_token");
-        const res = await fetch("/api/user-settings", {
-          headers: { Authorization: `Bearer ${token}` },
-        });
+        const res = await apiFetch("/api/user-settings");
         const data = await res.json().catch(() => ({}));
         if (!res.ok) throw new Error(data?.error || "Failed to load settings");
         if (data?.display_name) setDisplayName(data.display_name);
@@ -69,10 +64,7 @@ export default function UserChat() {
       if (!activeSessionId) return;
       setErrorMsg("");
       try {
-        const token = localStorage.getItem("auth_token");
-        const res = await fetch(`/api/chat/sessions/${activeSessionId}/messages`, {
-          headers: { Authorization: `Bearer ${token}` },
-        });
+        const res = await apiFetch(`/api/chat/sessions/${activeSessionId}/messages`);
         const data = await res.json().catch(() => ({}));
         if (!res.ok) throw new Error(data?.error || "Failed to load messages");
         const rows = data?.messages || [];
@@ -101,17 +93,14 @@ export default function UserChat() {
     if (autoScroll) messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, activeSessionId, autoScroll]);
 
-  function onLogout() {
-    localStorage.removeItem("auth_token");
-    localStorage.removeItem("home_route");
+  async function onLogout() {
+    await logoutSession();
     nav("/login", { replace: true });
   }
 
   async function createNewSession() {
-    const token = localStorage.getItem("auth_token");
-    const res = await fetch("/api/chat/sessions", {
+    const res = await apiFetch("/api/chat/sessions", {
       method: "POST",
-      headers: { Authorization: `Bearer ${token}` },
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(data?.error || "Failed to create session");
@@ -143,14 +132,10 @@ export default function UserChat() {
 
     try {
       setSending(true);
-      const token = localStorage.getItem("auth_token");
-      if (!token) throw new Error("Missing auth token. Please log in again.");
-
-      const res = await fetch("/api/chat", {
+      const res = await apiFetch("/api/chat", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
         },
         body: JSON.stringify({ message: text, topK: 6, sessionId: activeSession.id }),
       });
@@ -185,12 +170,10 @@ export default function UserChat() {
     if (!nextTitle) return;
     setErrorMsg("");
     try {
-      const token = localStorage.getItem("auth_token");
-      const res = await fetch(`/api/chat/sessions/${activeSession.id}`, {
+      const res = await apiFetch(`/api/chat/sessions/${activeSession.id}`, {
         method: "PATCH",
         headers: {
           "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
         },
         body: JSON.stringify({ title: nextTitle }),
       });
@@ -207,10 +190,7 @@ export default function UserChat() {
     if (!activeSession) return;
     setErrorMsg("");
     try {
-      const token = localStorage.getItem("auth_token");
-      const res = await fetch(`/api/chat/sessions/${activeSession.id}/export`, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
+      const res = await apiFetch(`/api/chat/sessions/${activeSession.id}/export`);
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data?.error || "Export failed");
       const content = data?.text || "";
@@ -232,10 +212,8 @@ export default function UserChat() {
     setStatusMsg("");
     setErrorMsg("");
     try {
-      const token = localStorage.getItem("auth_token");
-      const res = await fetch(`/api/chat/sessions/${sessionId}`, {
+      const res = await apiFetch(`/api/chat/sessions/${sessionId}`, {
         method: "DELETE",
-        headers: { Authorization: `Bearer ${token}` },
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data?.error || "Delete failed");
@@ -260,12 +238,10 @@ export default function UserChat() {
     setStatusMsg("");
     setErrorMsg("");
     try {
-      const token = localStorage.getItem("auth_token");
-      const res = await fetch("/api/user-settings", {
+      const res = await apiFetch("/api/user-settings", {
         method: "PUT",
         headers: {
           "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
         },
         body: JSON.stringify({
           display_name: displayName,

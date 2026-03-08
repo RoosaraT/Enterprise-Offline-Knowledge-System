@@ -3,6 +3,7 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import Button from "../components/Button.jsx";
 import AdminSidebar from "../components/AdminSidebar.jsx";
 import sortIcon from "../assets/sort.png";
+import { apiFetch } from "../lib/auth.js";
 
 function formatBytes(bytes) {
   if (!bytes || bytes < 1) return "0 B";
@@ -72,20 +73,12 @@ export default function Dashboard() {
   const [activeSortField, setActiveSortField] = useState("date");
   const [sizeSortOrder, setSizeSortOrder] = useState("largest");
 
-  function getTokenOrThrow() {
-    const token = localStorage.getItem("auth_token");
-    if (!token) throw new Error("Missing auth token. Please log in again.");
-    return token;
-  }
-
   async function uploadToBackend(files) {
-    const token = getTokenOrThrow();
     const formData = new FormData();
     for (const file of files) formData.append("files", file);
 
-    const res = await fetch("/api/upload", {
+    const res = await apiFetch("/api/upload", {
       method: "POST",
-      headers: { Authorization: `Bearer ${token}` },
       body: formData,
     });
 
@@ -98,10 +91,7 @@ export default function Dashboard() {
     setLoadingDocuments(true);
     setErrorMsg("");
     try {
-      const token = getTokenOrThrow();
-      const res = await fetch("/api/files", {
-        headers: { Authorization: `Bearer ${token}` },
-      });
+      const res = await apiFetch("/api/files");
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data?.error || `Load failed (${res.status})`);
 
@@ -180,7 +170,6 @@ export default function Dashboard() {
     setStatusMsg("");
     setErrorMsg("");
     try {
-      const token = getTokenOrThrow();
       const fileIds =
         Array.isArray(doc.fileIds) && doc.fileIds.length > 0
           ? doc.fileIds
@@ -191,9 +180,8 @@ export default function Dashboard() {
 
       for (const fileId of fileIds) {
         if (!fileId || Number.isNaN(fileId)) continue;
-        const res = await fetch(`/api/files/${fileId}`, {
+        const res = await apiFetch(`/api/files/${fileId}`, {
           method: "DELETE",
-          headers: { Authorization: `Bearer ${token}` },
         });
         const data = await res.json().catch(() => ({}));
         if (!res.ok) {
@@ -214,7 +202,6 @@ export default function Dashboard() {
     setStatusMsg("");
     setErrorMsg("");
     try {
-      const token = getTokenOrThrow();
       const resolvedFileId =
         doc.fileId ??
         (typeof doc.id === "string" && doc.id.startsWith("db-") ? Number(doc.id.slice(3)) : Number(doc.id));
@@ -223,9 +210,7 @@ export default function Dashboard() {
         throw new Error("Missing file id");
       }
 
-      const res = await fetch(`/api/files/${resolvedFileId}/view`, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
+      const res = await apiFetch(`/api/files/${resolvedFileId}/view`);
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
         throw new Error(data?.error || `View failed (${res.status})`);

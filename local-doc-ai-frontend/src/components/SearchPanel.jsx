@@ -1,5 +1,6 @@
 import React, { useMemo, useState } from "react";
 import Button from "./Button.jsx";
+import { apiFetch } from "../lib/auth.js";
 
 export default function SearchPanel({ files }) {
   const [query, setQuery] = useState("");
@@ -21,19 +22,12 @@ export default function SearchPanel({ files }) {
     setCitations([]);
 
     try {
-      const token = localStorage.getItem("auth_token");
-      if (!token) {
-        setError("Missing auth token. Please log in again.");
-        return;
-      }
-
       // Context (AI) mode -> /api/ask
       if (mode === "context") {
-        const res = await fetch("/api/ask", {
+        const res = await apiFetch("/api/ask", {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
-            Authorization: `Bearer ${token}`,
           },
           body: JSON.stringify({ question: query.trim(), topK: 6 }),
         });
@@ -50,11 +44,10 @@ export default function SearchPanel({ files }) {
       }
 
       // Exact mode -> /api/search
-      const res = await fetch("/api/search", {
+      const res = await apiFetch("/api/search", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
         },
         body: JSON.stringify({ query: query.trim(), topK: 20 }),
       });

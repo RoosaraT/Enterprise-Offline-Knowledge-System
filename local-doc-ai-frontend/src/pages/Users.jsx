@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useState } from "react";
 import AdminSidebar from "../components/AdminSidebar.jsx";
 import Button from "../components/Button.jsx";
+import { apiFetch } from "../lib/auth.js";
 
 function formatDate(value) {
   return new Date(value).toLocaleDateString();
@@ -26,10 +27,7 @@ export default function Users() {
       setLoading(true);
       setErrorMsg("");
       try {
-        const token = localStorage.getItem("auth_token");
-        const res = await fetch("/api/users", {
-          headers: { Authorization: `Bearer ${token}` },
-        });
+        const res = await apiFetch("/api/users");
         const data = await res.json().catch(() => ({}));
         if (!res.ok) {
           setErrorMsg(data?.error || "Failed to load users.");
@@ -54,12 +52,10 @@ export default function Users() {
     setErrorMsg("");
     const nextRole = user.role === "Admin" ? "User" : "Admin";
     try {
-      const token = localStorage.getItem("auth_token");
-      const res = await fetch(`/api/users/${user.id}`, {
+      const res = await apiFetch(`/api/users/${user.id}`, {
         method: "PATCH",
         headers: {
           "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
         },
         body: JSON.stringify({ role: nextRole }),
       });
@@ -77,12 +73,10 @@ export default function Users() {
     setErrorMsg("");
     const nextStatus = user.status === "Active" ? "Suspended" : "Active";
     try {
-      const token = localStorage.getItem("auth_token");
-      const res = await fetch(`/api/users/${user.id}`, {
+      const res = await apiFetch(`/api/users/${user.id}`, {
         method: "PATCH",
         headers: {
           "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
         },
         body: JSON.stringify({ status: nextStatus }),
       });
@@ -99,10 +93,8 @@ export default function Users() {
     setStatusMsg("");
     setErrorMsg("");
     try {
-      const token = localStorage.getItem("auth_token");
-      const res = await fetch(`/api/users/${user.id}`, {
+      const res = await apiFetch(`/api/users/${user.id}`, {
         method: "DELETE",
-        headers: { Authorization: `Bearer ${token}` },
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data?.error || "Delete failed");
@@ -113,17 +105,30 @@ export default function Users() {
     }
   }
 
+  async function onForceLogout(user) {
+    setStatusMsg("");
+    setErrorMsg("");
+    try {
+      const res = await apiFetch(`/api/users/${user.id}/revoke-sessions`, {
+        method: "POST",
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data?.error || "Force logout failed");
+      setStatusMsg(`Forced logout for ${user.email}.`);
+    } catch (err) {
+      setErrorMsg(err?.message || "Force logout failed.");
+    }
+  }
+
   async function onCreateUser(e) {
     e.preventDefault();
     setStatusMsg("");
     setErrorMsg("");
     try {
-      const token = localStorage.getItem("auth_token");
-      const res = await fetch("/api/users", {
+      const res = await apiFetch("/api/users", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
         },
         body: JSON.stringify(createForm),
       });
@@ -290,6 +295,13 @@ export default function Users() {
                             className="rounded-lg border border-red-200 px-2 py-1 text-xs text-red-700 hover:bg-red-50"
                           >
                             Delete
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => onForceLogout(user)}
+                            className="rounded-lg border border-zinc-200 px-2 py-1 text-xs text-zinc-700 hover:bg-zinc-100"
+                          >
+                            Force Logout
                           </button>
                         </div>
                       </td>

@@ -7,6 +7,10 @@ function formatDate(value) {
   return new Date(value).toLocaleDateString();
 }
 
+function isBuiltInAdmin(user) {
+  return String(user?.email || "").trim().toLowerCase() === "admin@company.com";
+}
+
 export default function Users() {
   const [users, setUsers] = useState([]);
   const [statusMsg, setStatusMsg] = useState("");
@@ -108,13 +112,15 @@ export default function Users() {
   async function onForceLogout(user) {
     setStatusMsg("");
     setErrorMsg("");
+    const confirmed = window.confirm(`Log out all active sessions for ${user.email}? The user can sign in again immediately.`);
+    if (!confirmed) return;
     try {
       const res = await apiFetch(`/api/users/${user.id}/revoke-sessions`, {
         method: "POST",
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data?.error || "Force logout failed");
-      setStatusMsg(`Forced logout for ${user.email}.`);
+      setStatusMsg(`Logged out active sessions for ${user.email}.`);
     } catch (err) {
       setErrorMsg(err?.message || "Force logout failed.");
     }
@@ -275,33 +281,41 @@ export default function Users() {
                       </td>
                       <td className="border-b border-zinc-100 px-4 py-3">
                         <div className="flex flex-wrap gap-2">
-                          <button
-                            type="button"
-                            onClick={() => onEditUser(user)}
-                            className="rounded-lg border border-zinc-200 px-2 py-1 text-xs text-zinc-700 hover:bg-zinc-100"
-                          >
-                            Switch Role
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => onToggleStatus(user)}
-                            className="rounded-lg border border-zinc-200 px-2 py-1 text-xs text-zinc-700 hover:bg-zinc-100"
-                          >
-                            Change Status
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => onDeleteUser(user)}
-                            className="rounded-lg border border-red-200 px-2 py-1 text-xs text-red-700 hover:bg-red-50"
-                          >
-                            Delete
-                          </button>
+                          {isBuiltInAdmin(user) ? (
+                            <span className="rounded-lg border border-zinc-200 px-2 py-1 text-xs text-zinc-500">
+                              Protected admin account
+                            </span>
+                          ) : (
+                            <>
+                              <button
+                                type="button"
+                                onClick={() => onEditUser(user)}
+                                className="rounded-lg border border-zinc-200 px-2 py-1 text-xs text-zinc-700 hover:bg-zinc-100"
+                              >
+                                Switch Role
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => onToggleStatus(user)}
+                                className="rounded-lg border border-zinc-200 px-2 py-1 text-xs text-zinc-700 hover:bg-zinc-100"
+                              >
+                                Change Status
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => onDeleteUser(user)}
+                                className="rounded-lg border border-red-200 px-2 py-1 text-xs text-red-700 hover:bg-red-50"
+                              >
+                                Delete
+                              </button>
+                            </>
+                          )}
                           <button
                             type="button"
                             onClick={() => onForceLogout(user)}
                             className="rounded-lg border border-zinc-200 px-2 py-1 text-xs text-zinc-700 hover:bg-zinc-100"
                           >
-                            Force Logout
+                            Log Out Sessions
                           </button>
                         </div>
                       </td>

@@ -538,6 +538,10 @@ function normalizeRole(role) {
   return "User";
 }
 
+function isBuiltInAdminUser(user) {
+  return String(user?.email || "").trim().toLowerCase() === "admin@company.com";
+}
+
 // -------------------- Session DB (temporary per user) --------------------
 function sessionDir(userId) {
   return path.resolve(`${sessionRoot}/${userId}`);
@@ -604,6 +608,80 @@ function looksLikePdf(filePath) {
   } catch {
     return false;
   }
+}
+
+async function indexStoredFile(fileRow) {
+  const fullPath = path.join(uploadDir, fileRow.stored_name);
+  if (!fs.existsSync(fullPath)) {
+    throw new Error("Stored file missing");
+  }
+
+  const insertChunk = db.prepare(`
+    INSERT INTO doc_chunks (file_id, file_name, location, content, embedding_json)
+    VALUES (?, ?, ?, ?, ?)
+  `);
+  const preparedChunks = [];
+
+  const nameLower = fileRow.original_name.toLowerCase();
+  const isPdf =
+    fileRow.mime_type === "application/pdf" ||
+    nameLower.endsWith(".pdf") ||
+    looksLikePdf(fullPath);
+
+  if (isPdf) {
+    const pages = await extractPdfPages(fullPath);
+    for (const p of pages) {
+      const pageText = (p.text || "").trim();
+      if (!pageText) continue;
+
+      const chunks = chunkText(pageText, 1200, 150);
+      for (const content of chunks) {
+        const emb = await ollamaEmbed(content);
+        preparedChunks.push({
+          location: `Page ${p.page}`,
+          content,
+          embedding_json: JSON.stringify(emb),
+        });
+      }
+    }
+  } else {
+    const isText =
+      (fileRow.mime_type && fileRow.mime_type.startsWith("text/")) ||
+      nameLower.endsWith(".txt") ||
+      nameLower.endsWith(".md") ||
+      nameLower.endsWith(".csv") ||
+      nameLower.endsWith(".log") ||
+      nameLower.endsWith(".json");
+
+    if (!isText) {
+      throw new Error("Unsupported file type for indexing");
+    }
+
+    const raw = fs.readFileSync(fullPath, "utf8");
+    const chunks = chunkText(raw, 1200, 150);
+    for (let i = 0; i < chunks.length; i++) {
+      const content = chunks[i];
+      const emb = await ollamaEmbed(content);
+      preparedChunks.push({
+        location: `Chunk ${i + 1}`,
+        content,
+        embedding_json: JSON.stringify(emb),
+      });
+    }
+  }
+
+  if (preparedChunks.length === 0) {
+    throw new Error("No indexable content found in file");
+  }
+
+  const replaceChunks = db.transaction((rows) => {
+    db.prepare("DELETE FROM doc_chunks WHERE file_id = ?").run(fileRow.id);
+    for (const row of rows) {
+      insertChunk.run(fileRow.id, fileRow.original_name, row.location, row.content, row.embedding_json);
+    }
+  });
+
+  replaceChunks(preparedChunks);
 }
 
 
@@ -814,8 +892,16 @@ app.get("/api/users", requireAuth, requireAdmin, (req, res) => {
 app.patch("/api/users/:id", requireAuth, requireCsrf, requireAdmin, (req, res) => {
   const id = Number(req.params.id);
   const { role, status, name } = req.body || {};
-  const user = db.prepare("SELECT id FROM users WHERE id = ?").get(id);
+  const user = db.prepare("SELECT id, email, role, status, name FROM users WHERE id = ?").get(id);
   if (!user) return res.status(404).json({ error: "User not found" });
+
+  if (isBuiltInAdminUser(user)) {
+    const nextRole = role ? normalizeRole(role) : user.role;
+    const nextStatus = status ? String(status).trim() : user.status;
+    if (nextRole !== "Admin" || nextStatus !== "Active") {
+      return res.status(403).json({ error: "Built-in admin role cannot be changed" });
+    }
+  }
 
   const nextRole = role ? normalizeRole(role) : null;
   const nextStatus = status ? String(status).trim() : null;
@@ -844,8 +930,11 @@ app.patch("/api/users/:id", requireAuth, requireCsrf, requireAdmin, (req, res) =
 
 app.delete("/api/users/:id", requireAuth, requireCsrf, requireAdmin, (req, res) => {
   const id = Number(req.params.id);
-  const user = db.prepare("SELECT id FROM users WHERE id = ?").get(id);
+  const user = db.prepare("SELECT id, email FROM users WHERE id = ?").get(id);
   if (!user) return res.status(404).json({ error: "User not found" });
+  if (isBuiltInAdminUser(user)) {
+    return res.status(403).json({ error: "Built-in admin cannot be deleted" });
+  }
   revokeUserSessions(id);
   db.prepare("DELETE FROM users WHERE id = ?").run(id);
   audit(req, "admin.user_deleted", { targetType: "user", targetId: id });
@@ -946,16 +1035,10 @@ app.put("/api/user-settings", requireAuth, requireCsrf, (req, res) => {
 app.post("/api/upload", requireAuth, requireCsrf, requireAdmin, rateLimit({ key: "upload", windowMs: UPLOAD_RATE_LIMIT_WINDOW_MS, maxRequests: UPLOAD_RATE_LIMIT_MAX }), upload.array("files", 50), async (req, res) => {
   try {
     const uploaded = req.files || [];
-    const userId = req.user.sub;
 
     const insertFile = db.prepare(`
       INSERT INTO files (original_name, stored_name, mime_type, size_bytes)
       VALUES (?, ?, ?, ?)
-    `);
-
-    const insertChunk = db.prepare(`
-      INSERT INTO doc_chunks (file_id, file_name, location, content, embedding_json)
-      VALUES (?, ?, ?, ?, ?)
     `);
 
     const results = [];
@@ -963,56 +1046,8 @@ app.post("/api/upload", requireAuth, requireCsrf, requireAdmin, rateLimit({ key:
     for (const f of uploaded) {
       const info = insertFile.run(f.originalname, f.filename, f.mimetype, f.size);
       const fileId = info.lastInsertRowid;
-
-      // ---- PDF ingest (FIXED: moved inside loop) ----
-      const fullPath = path.join(uploadDir, f.filename);
-      const nameLower = f.originalname.toLowerCase();
-      const isPdf =
-        f.mimetype === "application/pdf" ||
-        nameLower.endsWith(".pdf") ||
-        looksLikePdf(fullPath);
-
-      if (isPdf) {
-        const pages = await extractPdfPages(fullPath);
-        const nonEmpty = pages.filter(p => (p.text || "").trim().length > 0).length;
-        console.log("PDF pages:", pages.length, "nonempty:", nonEmpty);
- // [{page, text}...]
-
-        for (const p of pages) {
-          const pageText = (p.text || "").trim();
-          if (!pageText) continue;
-
-          const chunks = chunkText(pageText, 1200, 150);
-
-          for (let i = 0; i < chunks.length; i++) {
-            const content = chunks[i];
-            const location = `Page ${p.page}`;
-            const emb = await ollamaEmbed(content);
-            insertChunk.run(fileId, f.originalname, location, content, JSON.stringify(emb));
-          }
-        }
-      }
-
-      // ---- TXT ingest (same as before) ----
-      const isText =
-        (f.mimetype && f.mimetype.startsWith("text/")) ||
-        nameLower.endsWith(".txt") ||
-        nameLower.endsWith(".md") ||
-        nameLower.endsWith(".csv") ||
-        nameLower.endsWith(".log") ||
-        nameLower.endsWith(".json");
-
-      if (isText) {
-        const raw = fs.readFileSync(fullPath, "utf8");
-        const chunks = chunkText(raw, 1200, 150);
-
-        for (let i = 0; i < chunks.length; i++) {
-          const content = chunks[i];
-          const location = `Chunk ${i + 1}`;
-          const emb = await ollamaEmbed(content);
-          insertChunk.run(fileId, f.originalname, location, content, JSON.stringify(emb));
-        }
-      }
+      const fileRow = db.prepare("SELECT * FROM files WHERE id = ?").get(fileId);
+      await indexStoredFile(fileRow);
 
       results.push({ id: fileId, name: f.originalname, size: f.size, type: f.mimetype });
     }
@@ -1074,6 +1109,24 @@ app.delete("/api/files/:id", requireAuth, requireCsrf, requireAdmin, (req, res) 
     metadata: { name: row.original_name },
   });
   return res.json({ ok: true });
+});
+
+app.post("/api/files/:id/reindex", requireAuth, requireCsrf, requireAdmin, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const row = db.prepare("SELECT * FROM files WHERE id = ?").get(id);
+    if (!row) return res.status(404).json({ error: "File not found" });
+
+    await indexStoredFile(row);
+    audit(req, "admin.file_reindexed", {
+      targetType: "file",
+      targetId: id,
+      metadata: { name: row.original_name },
+    });
+    return res.json({ ok: true });
+  } catch (e) {
+    return res.status(500).json({ error: String(e.message || e) });
+  }
 });
 
 // Exact word/phrase search (fast, offline)

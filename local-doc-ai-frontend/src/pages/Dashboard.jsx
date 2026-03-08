@@ -72,6 +72,7 @@ export default function Dashboard() {
   const [sizeMenuOpen, setSizeMenuOpen] = useState(false);
   const [activeSortField, setActiveSortField] = useState("date");
   const [sizeSortOrder, setSizeSortOrder] = useState("largest");
+  const [reindexingIds, setReindexingIds] = useState([]);
 
   async function uploadToBackend(files) {
     const formData = new FormData();
@@ -225,12 +226,35 @@ export default function Dashboard() {
     }
   }
 
-  function onReindexDocument(id) {
-    setDocuments((prev) => prev.map((d) => (d.id === id ? { ...d, status: "Indexing" } : d)));
-    setTimeout(() => {
-      setDocuments((prev) => prev.map((d) => (d.id === id ? { ...d, status: "Indexed" } : d)));
-      setStatusMsg("Re-index complete.");
-    }, 700);
+  async function onReindexDocument(doc) {
+    setStatusMsg("");
+    setErrorMsg("");
+    setReindexingIds((prev) => [...new Set([...prev, doc.id])]);
+    setDocuments((prev) => prev.map((d) => (d.id === doc.id ? { ...d, status: "Indexing" } : d)));
+
+    try {
+      const fileId =
+        doc.fileId ??
+        (typeof doc.id === "string" && doc.id.startsWith("db-") ? Number(doc.id.slice(3)) : Number(doc.id));
+
+      if (!fileId || Number.isNaN(fileId)) {
+        throw new Error("Missing file id");
+      }
+
+      const res = await apiFetch(`/api/files/${fileId}/reindex`, {
+        method: "POST",
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data?.error || `Re-index failed (${res.status})`);
+
+      await loadDocuments();
+      setStatusMsg(`Re-indexed "${doc.name}" successfully.`);
+    } catch (err) {
+      setDocuments((prev) => prev.map((d) => (d.id === doc.id ? { ...d, status: "Indexed" } : d)));
+      setErrorMsg(err?.message || "Re-index failed");
+    } finally {
+      setReindexingIds((prev) => prev.filter((id) => id !== doc.id));
+    }
   }
 
   const filteredDocuments = useMemo(() => {
@@ -489,27 +513,37 @@ export default function Dashboard() {
                       </td>
                       <td className="border-b border-zinc-100 px-4 py-3">
                         <div className="flex flex-wrap gap-2">
+                          {(() => {
+                            const isReindexing = reindexingIds.includes(doc.id);
+                            return (
+                              <>
                           <button
                             type="button"
                             onClick={() => onViewDocument(doc)}
-                            className="rounded-lg border border-zinc-200 px-2 py-1 text-xs text-zinc-700 hover:bg-zinc-100"
+                            disabled={isReindexing}
+                            className="rounded-lg border border-zinc-200 px-2 py-1 text-xs text-zinc-700 hover:bg-zinc-100 disabled:cursor-not-allowed disabled:opacity-50"
                           >
                             View
                           </button>
                           <button
                             type="button"
                             onClick={() => onDeleteDocument(doc)}
-                            className="rounded-lg border border-red-200 px-2 py-1 text-xs text-red-700 hover:bg-red-50"
+                            disabled={isReindexing}
+                            className="rounded-lg border border-red-200 px-2 py-1 text-xs text-red-700 hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-50"
                           >
                             Delete
                           </button>
                           <button
                             type="button"
-                            onClick={() => onReindexDocument(doc.id)}
-                            className="rounded-lg border border-zinc-200 px-2 py-1 text-xs text-zinc-700 hover:bg-zinc-100"
+                            onClick={() => onReindexDocument(doc)}
+                            disabled={isReindexing}
+                            className="rounded-lg border border-zinc-200 px-2 py-1 text-xs text-zinc-700 hover:bg-zinc-100 disabled:cursor-not-allowed disabled:opacity-50"
                           >
-                            Re-index
+                            {isReindexing ? "Re-indexing..." : "Re-index"}
                           </button>
+                              </>
+                            );
+                          })()}
                         </div>
                       </td>
                     </tr>

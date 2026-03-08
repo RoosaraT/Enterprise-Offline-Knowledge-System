@@ -4,7 +4,11 @@ import { apiFetch } from "../lib/auth.js";
 
 function formatDateTime(value) {
   if (!value) return "-";
-  return new Date(value).toLocaleString();
+  const normalized =
+    typeof value === "string" && /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(value)
+      ? value.replace(" ", "T") + "Z"
+      : value;
+  return new Date(normalized).toLocaleString();
 }
 
 export default function AuditLogs() {
